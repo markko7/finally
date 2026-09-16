@@ -454,3 +454,28 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Doc Review Notes (2026-09-14)
+
+Reviewed against the current state of the repo (market data backend complete; frontend, db module, chat, portfolio, and Docker packaging not yet built).
+
+### Open Questions / Clarifications
+
+1. **Position exists but ticker isn't watched.** The watchlist and the price cache are described as the same set of "known" tickers (§6). But a user can `DELETE /api/watchlist/{ticker}` while still holding a position in it. Does removal get blocked while a position is open, or does the price cache keep tracking held-but-unwatched tickers separately from the display watchlist? As written, removing a watched ticker you own would freeze its price for P&L purposes and there'd be no UI path to sell it without re-adding it.
+2. **SSE cadence vs. actual implementation.** §6 says the server "pushes price updates for all tickers ... at a regular cadence (~500ms)." The already-built `stream.py` (per `MARKET_DATA_SUMMARY.md`) instead uses version-based change detection — it pushes only on change, not a blind full broadcast every tick. Worth updating §6 to match so later agents don't treat the blind-cadence description as the spec.
+3. **Trade quantity units.** The structured-output schema (§9) and the trade bar (§10) both take `quantity`. Is that always share count, or can the LLM/user express a dollar amount (e.g., "buy $500 of AAPL")? Given fractional shares are already supported in the schema, clarifying "shares only, LLM must convert dollar requests to shares" (or the reverse) would remove ambiguity for whoever builds the chat and trade-bar logic.
+4. **`watchlist_changes.action` enum.** Only `"add"` appears in the example (§9). Confirming `"remove"` is the only other valid value (and what happens on an unknown ticker, or removing one currently held) would save the LLM prompt-writer a guess.
+5. **`LLM_MOCK=true` behavior is unspecified.** §5/§12 say mock mode returns "deterministic mock LLM responses" but not the actual rule (fixed canned response? keyword-triggered per test scenario? echo with a scripted trade?). Since E2E tests depend on it, pinning down the mock's decision logic now would prevent the test suite and the mock implementation from being built against different assumptions.
+6. **"Current price" at trade execution.** Market orders fill "instantly at current price" (§2, §8) — presumably the server-side price cache value at the moment `/api/portfolio/trade` is handled, not whatever price the client last rendered. Worth stating explicitly, since SSE delivery has inherent lag and a client-displayed price could differ slightly from the fill price.
+7. **No LLM trade sizing guardrail.** Trades from the LLM auto-execute with no confirmation (§9), same as manual trades. Manual trades are bounded by the UI form; LLM trades are bounded only by the cash/shares validation. Is a hallucinated quantity (e.g., "buy 500000 shares") acceptable because it'll just fail on insufficient cash, or should the system prompt also cap position size/order size explicitly? Probably fine to leave as "cash validation is the only guardrail," but worth saying so on purpose rather than by omission.
+8. **Average cost formula unstated.** `positions.avg_cost` (§7) is presumably a running weighted average on buys, unchanged on sells. Spelling that out as one line avoids two agents implementing subtly different cost-basis math.
+9. **"Massive API" naming.** §6/§9 refer to "Massive" without saying what it is. `MARKET_DATA_SUMMARY.md` clarifies it's a Python package (`massive`) wrapping Polygon.io. A one-line pointer in §6 ("Massive = Polygon.io via the `massive` package") would save the next reader a repo search.
+10. **Portfolio total value updates.** §10 says the header shows portfolio total value "updating live." Is that computed client-side from the SSE price stream against cached positions, or does the frontend re-poll `/api/portfolio`? Given SSE already carries live prices, client-side recompute seems like the natural (and simpler) choice — worth stating so the frontend doesn't add unnecessary polling.
+
+### Simplification Opportunities
+
+- **Drop the Terraform/App Runner stretch goal from the core plan.** §11's "Optional Cloud Deployment" is explicitly a stretch goal not part of the core build. Moving it to a separate `planning/stretch-goals.md` (or just deleting it until it's actually wanted) keeps PLAN.md focused on what's actually being built.
+- **E2E Docker requirement for local iteration.** §12's `docker-compose.test.yml` is good for CI, but requiring a full Docker build for every local Playwright run during frontend development will slow iteration. Consider explicitly allowing Playwright to run against `next dev` + local `uvicorn` for local loops, reserving the compose file for CI/final verification — this is likely intended already but isn't stated.
+- **SSE change-only pushes (already built) simplify the sparkline story.** Since prices only broadcast on change, the frontend doesn't need to de-dupe flat ticks itself before appending sparkline points — worth calling out in §10 so the Frontend Engineer doesn't add redundant de-dupe logic.
