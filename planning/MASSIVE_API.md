@@ -271,6 +271,11 @@ tradeoff for a course-capstone paper-trading app, but worth stating rather than 
 
 ## 6. Timestamp Field Caveat
 
+> **Resolved 2026-10-08** — see `planning/MARKET_DATA_DESIGN.md` §7.3–7.4. The SDK
+> (`massive==2.2.0`) exposes snapshot `lastTrade.t` as `last_trade.sip_timestamp`, unconverted
+> Unix nanoseconds. `LastTrade` has no `.timestamp` attribute, so the original
+> `massive_client.py` skipped every ticker (fixed 2026-10-08). The original research note follows.
+
 The snapshot endpoint's `lastTrade.t` appeared as a 19-digit number in Massive's own
 documented example (`1605192894630916600`), which is Unix **nanoseconds**. The grouped
 daily endpoint's `t` field, by contrast, is a 13-digit number in its documented example

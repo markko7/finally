@@ -14,6 +14,20 @@ from .interface import MarketDataSource
 logger = logging.getLogger(__name__)
 
 
+def _to_epoch_seconds(ts: int | float | None) -> float | None:
+    """Normalize a Massive timestamp (s, ms, µs or ns) to Unix seconds."""
+    if not ts:
+        return None
+    ts = float(ts)
+    if ts > 1e17:
+        return ts / 1e9
+    if ts > 1e14:
+        return ts / 1e6
+    if ts > 1e11:
+        return ts / 1e3
+    return ts
+
+
 class MassiveDataSource(MarketDataSource):
     """MarketDataSource backed by the Massive (Polygon.io) REST API.
 
@@ -98,16 +112,17 @@ class MassiveDataSource(MarketDataSource):
             processed = 0
             for snap in snapshots:
                 try:
-                    price = snap.last_trade.price
-                    # Massive timestamps are Unix milliseconds → convert to seconds
-                    timestamp = snap.last_trade.timestamp / 1000.0
+                    trade = snap.last_trade
+                    if trade is None or trade.price is None:
+                        raise ValueError("no last trade in snapshot")
+                    timestamp = _to_epoch_seconds(trade.sip_timestamp or snap.updated)
                     self._cache.update(
                         ticker=snap.ticker,
-                        price=price,
+                        price=trade.price,
                         timestamp=timestamp,
                     )
                     processed += 1
-                except (AttributeError, TypeError) as e:
+                except (AttributeError, TypeError, ValueError) as e:
                     logger.warning(
                         "Skipping snapshot for %s: %s",
                         getattr(snap, "ticker", "???"),

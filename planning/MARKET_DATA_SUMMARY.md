@@ -44,7 +44,7 @@ MarketDataSource (ABC)
 
 ## Test Suite
 
-**73 tests, all passing.** 6 test modules in `backend/tests/market/`.
+**82 tests, all passing.** 7 test modules in `backend/tests/market/`.
 
 | Module | Tests | Coverage |
 |--------|-------|----------|
@@ -53,9 +53,15 @@ MarketDataSource (ABC)
 | test_simulator.py | 17 | simulator.py: 98% |
 | test_simulator_source.py | 10 | (integration tests) |
 | test_factory.py | 7 | factory.py: 100% |
-| test_massive.py | 13 | massive_client.py: 56% (expected — API methods mocked) |
+| test_massive.py | 21 | massive_client.py: 95% (snapshots built with the real SDK model) |
+| test_stream.py | 1 | stream.py: 42% (router factory only; SSE generator needs a server) |
 
-Overall coverage: 84%.
+Overall coverage: 92%. Run with `uv run --extra dev pytest` from `backend/`.
+
+**2026-10-08 fixes:** Massive mode read `last_trade.timestamp`, which the SDK model doesn't
+have (it's `sip_timestamp`, in nanoseconds), so every ticker was skipped. The SSE router was
+a module-level singleton that double-registered routes. Both are fixed; see
+`MARKET_DATA_DESIGN.md` §7.4 and §9.4.
 
 ## Code Review & Fixes Applied
 
