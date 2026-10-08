@@ -5,15 +5,28 @@ Implementation-ready, as-built design for the FinAlly market data subsystem: the
 (Polygon.io) REST client, the SSE streaming endpoint, and how the not-yet-built
 `backend/app/main.py` should wire all of it into the FastAPI app lifecycle.
 
-**Status:** everything in §§1–9 below is already implemented in `backend/app/market/` (8
-modules, ~500 lines, 73 passing tests, 84% coverage — see `planning/MARKET_DATA_SUMMARY.md`).
-Code blocks in those sections are copied verbatim from the real source, not a proposal.
+**Status (revised 2026-10-08):** everything in §§1–9 is implemented in
+`backend/app/market/` (8 modules, ~500 lines, 73 passing tests). Code blocks in those sections
+match the source exactly, except where a section is labelled as a required fix. This revision
+checked every block against the code and the locked `massive==2.2.0` SDK, and found two
+defects in the shipped code:
+
+| § | Defect | Impact | Fix size |
+|---|---|---|---|
+| 7.4 | `massive_client.py` reads `snap.last_trade.timestamp`, which the SDK model does not have (the field is `sip_timestamp`, in nanoseconds). | **Massive mode delivers no prices at all**: every ticker is skipped with a warning. Simulator mode is unaffected. Tests miss it because they use `MagicMock` snapshots. | ~15 lines + test helper (§12.4) |
+| 9.4 | `stream.py` decorates a module-level `APIRouter`, so a second `create_stream_router()` call registers `/api/stream/prices` twice. | Only bites when two apps are built in one process (tests). | 2 lines |
+
+Both fixes were run against the real SDK and the existing suite before being written here.
+Neither has been applied to `backend/app/market/` yet.
+
 §§10–13 (lifecycle wiring, watchlist coordination, testing patterns, error handling) describe
-how the rest of the backend — `main.py`, portfolio routes, watchlist routes, chat routes,
-none of which exist yet — should consume this subsystem. Where the plan and the build
-disagree, this document follows the build and notes the correction; see
-`planning/PLAN.md` §13 and `planning/REVIEW.md`/`planning/archive/MARKET_DATA_REVIEW.md` for
-the discrepancies that were found and resolved this way.
+how the rest of the backend should consume this subsystem: `main.py`, portfolio routes,
+watchlist routes and chat routes, none of which exist yet. Where the plan and the build
+disagree, this document follows the build and notes the correction; see `planning/PLAN.md`
+§13 and `planning/archive/MARKET_DATA_REVIEW.md`.
+
+Run the suite from `backend/` with `uv run --extra dev pytest` (pytest lives in the `dev`
+extra; plain `uv run pytest` may pick up a global pytest that can't import `massive`).
 
 Everything under §§1–9 lives in `backend/app/market/`.
 
@@ -560,10 +573,19 @@ class GBMSimulator:
     Math:
         S(t+dt) = S(t) * exp((mu - sigma^2/2) * dt + sigma * sqrt(dt) * Z)
 
+    Where:
+        S(t)   = current price
+        mu     = annualized drift (expected return)
+        sigma  = annualized volatility
+        dt     = time step as fraction of a trading year
+        Z      = correlated standard normal random variable
+
     The tiny dt (~8.5e-8 for 500ms ticks over 252 trading days * 6.5h/day)
     produces sub-cent moves per tick that accumulate naturally over time.
     """
 
+    # 500ms expressed as a fraction of a trading year
+    # 252 trading days * 6.5 hours/day * 3600 seconds/hour = 5,896,800 seconds
     TRADING_SECONDS_PER_YEAR = 252 * 6.5 * 3600  # 5,896,800
     DEFAULT_DT = 0.5 / TRADING_SECONDS_PER_YEAR  # ~8.48e-8
 
@@ -576,11 +598,15 @@ class GBMSimulator:
         self._dt = dt
         self._event_prob = event_probability
 
+        # Per-ticker state
         self._tickers: list[str] = []
         self._prices: dict[str, float] = {}
         self._params: dict[str, dict[str, float]] = {}
+
+        # Cholesky decomposition of the correlation matrix (for correlated moves)
         self._cholesky: np.ndarray | None = None
 
+        # Initialize all starting tickers
         for ticker in tickers:
             self._add_ticker_internal(ticker)
         self._rebuild_cholesky()
@@ -596,8 +622,14 @@ class GBMSimulator:
         if n == 0:
             return {}
 
+        # Generate n independent standard normal draws
         z_independent = np.random.standard_normal(n)
-        z_correlated = self._cholesky @ z_independent if self._cholesky is not None else z_independent
+
+        # Apply Cholesky to get correlated draws
+        if self._cholesky is not None:
+            z_correlated = self._cholesky @ z_independent
+        else:
+            z_correlated = z_independent
 
         result: dict[str, float] = {}
         for i, ticker in enumerate(self._tickers):
@@ -605,6 +637,7 @@ class GBMSimulator:
             mu = params["mu"]
             sigma = params["sigma"]
 
+            # GBM: S(t+dt) = S(t) * exp((mu - 0.5*sigma^2)*dt + sigma*sqrt(dt)*Z)
             drift = (mu - 0.5 * sigma**2) * self._dt
             diffusion = sigma * math.sqrt(self._dt) * z_correlated[i]
             self._prices[ticker] *= math.exp(drift + diffusion)
@@ -617,7 +650,9 @@ class GBMSimulator:
                 self._prices[ticker] *= 1 + shock_magnitude * shock_sign
                 logger.debug(
                     "Random event on %s: %.1f%% %s",
-                    ticker, shock_magnitude * 100, "up" if shock_sign > 0 else "down",
+                    ticker,
+                    shock_magnitude * 100,
+                    "up" if shock_sign > 0 else "down",
                 )
 
             result[ticker] = round(self._prices[ticker], 2)
@@ -641,9 +676,11 @@ class GBMSimulator:
         self._rebuild_cholesky()
 
     def get_price(self, ticker: str) -> float | None:
+        """Current price for a ticker, or None if not tracked."""
         return self._prices.get(ticker)
 
     def get_tickers(self) -> list[str]:
+        """Return the list of currently tracked tickers."""
         return list(self._tickers)
 
     # --- Internals ---
@@ -657,28 +694,48 @@ class GBMSimulator:
         self._params[ticker] = TICKER_PARAMS.get(ticker, dict(DEFAULT_PARAMS))
 
     def _rebuild_cholesky(self) -> None:
+        """Rebuild the Cholesky decomposition of the ticker correlation matrix.
+
+        Called whenever tickers are added or removed. O(n^2) but n < 50.
+        """
         n = len(self._tickers)
         if n <= 1:
             self._cholesky = None
             return
+
+        # Build the correlation matrix
         corr = np.eye(n)
         for i in range(n):
             for j in range(i + 1, n):
                 rho = self._pairwise_correlation(self._tickers[i], self._tickers[j])
                 corr[i, j] = rho
                 corr[j, i] = rho
+
         self._cholesky = np.linalg.cholesky(corr)
 
     @staticmethod
     def _pairwise_correlation(t1: str, t2: str) -> float:
+        """Determine correlation between two tickers based on sector grouping.
+
+        Correlation structure:
+          - Same tech sector:   0.6
+          - Same finance sector: 0.5
+          - TSLA with anything: 0.3 (it does its own thing)
+          - Cross-sector:       0.3
+          - Unknown tickers:    0.3
+        """
         tech = CORRELATION_GROUPS["tech"]
         finance = CORRELATION_GROUPS["finance"]
+
+        # TSLA is in tech set but behaves independently
         if t1 == "TSLA" or t2 == "TSLA":
             return TSLA_CORR
+
         if t1 in tech and t2 in tech:
             return INTRA_TECH_CORR
         if t1 in finance and t2 in finance:
             return INTRA_FINANCE_CORR
+
         return CROSS_GROUP_CORR
 ```
 
@@ -709,7 +766,10 @@ class SimulatorDataSource(MarketDataSource):
         self._task: asyncio.Task | None = None
 
     async def start(self, tickers: list[str]) -> None:
-        self._sim = GBMSimulator(tickers=tickers, event_probability=self._event_prob)
+        self._sim = GBMSimulator(
+            tickers=tickers,
+            event_probability=self._event_prob,
+        )
         # Seed the cache with initial prices so SSE has data immediately
         for ticker in tickers:
             price = self._sim.get_price(ticker)
@@ -820,7 +880,93 @@ real-time (`planning/MASSIVE_API.md` §5.1). Do not loop the per-ticker `open-cl
 `last-trade` endpoints over the watchlist — that burns 10 requests/cycle against a 5 req/min
 budget and gets rate-limited almost immediately.
 
-### 7.3 The full class
+### 7.3 SDK model: what `get_snapshot_all()` actually returns
+
+Verified on 2026-10-08 against the locked SDK (`massive==2.2.0`,
+`massive/rest/models/snapshot.py` and `massive/rest/models/trades.py`). The SDK maps the raw
+JSON keys onto these dataclass fields with no unit conversion:
+
+| Raw JSON (`tickers[i]`) | SDK attribute | Type / unit |
+|---|---|---|
+| `ticker` | `snap.ticker` | `str` |
+| `lastTrade.p` | `snap.last_trade.price` | `float`, dollars |
+| `lastTrade.t` | `snap.last_trade.sip_timestamp` | `int`, **Unix nanoseconds** |
+| `lastTrade.y` | `snap.last_trade.participant_timestamp` | `int`, Unix nanoseconds |
+| `updated` | `snap.updated` | `int`, Unix nanoseconds |
+| `todaysChange` / `todaysChangePerc` | `snap.todays_change` / `snap.todays_change_percent` | `float` |
+| `prevDay.c` | `snap.prev_day.close` | `float` |
+| `lastTrade` missing | `snap.last_trade is None` | e.g. no trades yet today |
+
+**There is no `LastTrade.timestamp` attribute.** Reproduction against the real SDK:
+
+```python
+>>> from massive.rest.models import TickerSnapshot
+>>> s = TickerSnapshot.from_dict({"ticker": "BCAT",
+...     "lastTrade": {"p": 20.506, "t": 1605192894630916600}})
+>>> s.last_trade.price, s.last_trade.sip_timestamp
+(20.506, 1605192894630916600)
+>>> s.last_trade.timestamp
+AttributeError: 'LastTrade' object has no attribute 'timestamp'
+```
+
+### 7.4 Defect in the shipped `_poll_once()`, and the required fix
+
+The shipped `massive_client.py` (lines 101-103) reads `snap.last_trade.timestamp / 1000.0`.
+With the real SDK that line raises `AttributeError` for **every** ticker. The `except
+(AttributeError, TypeError)` around it turns each failure into a "Skipping snapshot" warning.
+So in Massive mode the cache is never filled, the SSE stream sends nothing, and every trade
+gets "price not available". The 13 Massive tests still pass because they build snapshots with
+`MagicMock`, which invents a `.timestamp` attribute on demand (§12.4).
+
+The `/ 1000.0` (milliseconds) assumption was also wrong. `lastTrade.t` is nanoseconds, so
+even with the right attribute name the timestamps would land in the year ~50,000.
+
+The fix reads `sip_timestamp`, falls back to the snapshot's `updated` field, and converts
+by magnitude so a ms/µs/ns unit change on the vendor side can't silently break it again:
+
+```python
+def _to_epoch_seconds(ts: int | float | None) -> float | None:
+    """Normalize a Massive timestamp (s, ms, µs or ns) to Unix seconds.
+
+    Snapshot fields are nanoseconds today, but Massive documents other endpoints in
+    milliseconds, so detect the unit by magnitude instead of hard-coding it.
+    """
+    if not ts:
+        return None
+    ts = float(ts)
+    if ts > 1e17:  # nanoseconds  (~1.7e18 in 2026)
+        return ts / 1e9
+    if ts > 1e14:  # microseconds (~1.7e15)
+        return ts / 1e6
+    if ts > 1e11:  # milliseconds (~1.7e12)
+        return ts / 1e3
+    return ts      # already seconds (~1.7e9)
+```
+
+Corrected loop body (replaces lines 99-115 of `massive_client.py`):
+
+```python
+            for snap in snapshots:
+                try:
+                    trade = snap.last_trade
+                    if trade is None or trade.price is None:
+                        raise ValueError("no last trade in snapshot")
+                    timestamp = _to_epoch_seconds(trade.sip_timestamp or snap.updated)
+                    self._cache.update(
+                        ticker=snap.ticker,
+                        price=trade.price,
+                        timestamp=timestamp,  # None -> PriceCache uses time.time()
+                    )
+                    processed += 1
+                except (AttributeError, TypeError, ValueError) as e:
+                    logger.warning(
+                        "Skipping snapshot for %s: %s",
+                        getattr(snap, "ticker", "???"),
+                        e,
+                    )
+```
+
+Everything else in the class stays as shipped. The full corrected module:
 
 ```python
 """Massive (Polygon.io) API client for real market data."""
@@ -837,6 +983,20 @@ from .cache import PriceCache
 from .interface import MarketDataSource
 
 logger = logging.getLogger(__name__)
+
+
+def _to_epoch_seconds(ts: int | float | None) -> float | None:
+    """Normalize a Massive timestamp (s, ms, µs or ns) to Unix seconds."""
+    if not ts:
+        return None
+    ts = float(ts)
+    if ts > 1e17:
+        return ts / 1e9
+    if ts > 1e14:
+        return ts / 1e6
+    if ts > 1e11:
+        return ts / 1e3
+    return ts
 
 
 class MassiveDataSource(MarketDataSource):
@@ -873,7 +1033,8 @@ class MassiveDataSource(MarketDataSource):
         self._task = asyncio.create_task(self._poll_loop(), name="massive-poller")
         logger.info(
             "Massive poller started: %d tickers, %.1fs interval",
-            len(tickers), self._interval,
+            len(tickers),
+            self._interval,
         )
 
     async def stop(self) -> None:
@@ -922,14 +1083,21 @@ class MassiveDataSource(MarketDataSource):
             processed = 0
             for snap in snapshots:
                 try:
-                    price = snap.last_trade.price
-                    # Massive timestamps are Unix milliseconds → convert to seconds
-                    timestamp = snap.last_trade.timestamp / 1000.0
-                    self._cache.update(ticker=snap.ticker, price=price, timestamp=timestamp)
+                    trade = snap.last_trade
+                    if trade is None or trade.price is None:
+                        raise ValueError("no last trade in snapshot")
+                    timestamp = _to_epoch_seconds(trade.sip_timestamp or snap.updated)
+                    self._cache.update(
+                        ticker=snap.ticker,
+                        price=trade.price,
+                        timestamp=timestamp,
+                    )
                     processed += 1
-                except (AttributeError, TypeError) as e:
+                except (AttributeError, TypeError, ValueError) as e:
                     logger.warning(
-                        "Skipping snapshot for %s: %s", getattr(snap, "ticker", "???"), e,
+                        "Skipping snapshot for %s: %s",
+                        getattr(snap, "ticker", "???"),
+                        e,
                     )
             logger.debug("Massive poll: updated %d/%d tickers", processed, len(self._tickers))
 
@@ -946,26 +1114,22 @@ class MassiveDataSource(MarketDataSource):
         )
 ```
 
-**`massive` is a top-level import, not a lazy one.** An earlier draft of this design lazily
-imported `massive` inside `start()`/`factory.py` so students without a Massive key wouldn't
-need the package installed. The actual implementation imports `massive` at module load time
-instead — it's a core dependency in `backend/pyproject.toml` regardless of whether
-`MASSIVE_API_KEY` is set, which is simpler and was the fix applied during code review (see
-`planning/MARKET_DATA_SUMMARY.md`, review item 2). Practical effect: `uv sync` always
-installs `massive`; only *using* `MassiveDataSource` requires a real key.
+**`massive` is a top-level import, not a lazy one.** An earlier draft lazily imported
+`massive` inside `start()`/`factory.py` so students without a Massive key wouldn't need the
+package. The build imports it at module load instead. It is a core dependency in
+`backend/pyproject.toml` whether or not `MASSIVE_API_KEY` is set, which is simpler, and was
+the fix applied in code review (`planning/MARKET_DATA_SUMMARY.md`, review item 2). `uv sync`
+always installs `massive`; only *using* `MassiveDataSource` needs a real key.
 
-**Timestamp unit caveat (unresolved, flagged for whoever next touches this file):**
-`_poll_once()` divides `snap.last_trade.timestamp` by `1000.0`, assuming milliseconds.
-Massive's own documented example response for this exact snapshot endpoint shows a 19-digit
-`lastTrade.t` value (`1605192894630916600`), which is Unix **nanoseconds**, not
-milliseconds — see `planning/MASSIVE_API.md` §6. This may be off by a factor of 1,000,000
-for real Massive responses (either producing timestamps in 1970, or the SDK may already
-normalize units before exposing `.timestamp`, in which case the current `/1000.0` is
-correct). This has not been verified against a live API response or the SDK's internal
-conversion code — verify with a real `MASSIVE_API_KEY` before relying on Massive mode's
-displayed timestamps for anything beyond ordering.
+**Ticker case.** `add_ticker`/`remove_ticker` upper-case their input; `start()` does not, and
+neither does the simulator. Callers (the watchlist routes) should normalize tickers to
+upper case once, at the API boundary, so both sources see the same symbols.
 
-### 7.4 Error handling philosophy
+**Market hours.** Massive clears snapshot data at midnight Eastern and refills it from about
+4am Eastern (SDK docstring). Overnight, `last_trade` can be missing for some tickers. The fix
+above skips those with a warning, and the cache keeps their last known price.
+
+### 7.5 Error handling philosophy
 
 The Massive poller is intentionally resilient — a bad poll should never take down price
 streaming, only leave it stale until the next successful poll:
@@ -1109,6 +1273,7 @@ async def _generate_events(
 
     try:
         while True:
+            # Check for client disconnect
             if await request.is_disconnected():
                 logger.info("SSE client disconnected: %s", client_ip)
                 break
@@ -1177,6 +1342,34 @@ a clean visualization.
 
 ---
 
+### 9.4 Known issue: the router is a module-level singleton
+
+`router = APIRouter(...)` sits at module scope and `create_stream_router()` decorates the
+same object each time it is called. One call from `main.py` is fine. A second call (two
+`FastAPI` apps in one test session, or a test that builds its own app) registers
+`/api/stream/prices` twice on the shared router, and the first registration still closes over
+the *first* `PriceCache`. A test can then read prices from the wrong cache with no error.
+
+Fix: build the router inside the factory so each call gets its own.
+
+```python
+def create_stream_router(price_cache: PriceCache) -> APIRouter:
+    """Create the SSE streaming router with a reference to the price cache."""
+    router = APIRouter(prefix="/api/stream", tags=["streaming"])
+
+    @router.get("/prices")
+    async def stream_prices(request: Request) -> StreamingResponse:
+        ...  # body unchanged
+
+    return router
+```
+
+and delete the module-level `router = APIRouter(...)` line. Nothing imports `stream.router`
+directly (only `create_stream_router` is exported from `app.market`), so this is a
+two-line change with no callers to update.
+
+---
+
 ## 10. FastAPI Lifecycle Integration
 
 **Not yet built.** `backend/app/` currently contains only `market/`; there is no
@@ -1190,53 +1383,72 @@ async context manager:
 ```python
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
-from app.market import PriceCache, MarketDataSource, create_market_data_source, create_stream_router
+from app.market import (
+    MarketDataSource,
+    PriceCache,
+    create_market_data_source,
+    create_stream_router,
+)
+from app import db  # not yet built: schema, seed, queries
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage startup and shutdown of background services."""
-
+    """Start and stop background services."""
     # --- STARTUP ---
-
-    # 1. Create the shared price cache
-    price_cache = PriceCache()
-    app.state.price_cache = price_cache
-
-    # 2. Create the market data source (reads MASSIVE_API_KEY)
-    source = create_market_data_source(price_cache)
-    app.state.market_source = source
-
-    # 3. Initialize/seed the database, then load the tracked ticker set.
-    #    Must happen HERE, synchronously, before source.start() — NOT deferred
-    #    to first request. The market source needs the ticker list at startup;
-    #    a lazy "init on first request" DB (as an earlier plan draft allowed)
-    #    would leave source.start() with nothing to track.
+    # 1. Initialize/seed the database HERE, before the market source starts.
+    #    The source needs the ticker list at startup; a lazy "init on first
+    #    request" DB would leave source.start() with nothing to track.
     await db.init_and_seed()
-    tracked_tickers = await db.get_tracked_tickers()  # watchlist ∪ held positions — see §11
-    await source.start(tracked_tickers)
 
-    # 4. Register the SSE streaming router
-    app.include_router(create_stream_router(price_cache))
+    # 2. Tracked set = watchlist ∪ tickers with an open position (see §11.3).
+    tracked = await db.get_tracked_tickers()
 
-    yield  # App is running
+    # 3. Start the source chosen by MASSIVE_API_KEY.
+    await app.state.market_source.start(tracked)
+
+    yield  # app is running
 
     # --- SHUTDOWN ---
-    await source.stop()
+    await app.state.market_source.stop()
 
 
-app = FastAPI(title="FinAlly", lifespan=lifespan)
+def create_app() -> FastAPI:
+    # Cache and source exist before the app starts, so routers can be
+    # included at construction time (not from inside the lifespan).
+    price_cache = PriceCache()
+    source = create_market_data_source(price_cache)  # unstarted
+
+    app = FastAPI(title="FinAlly", lifespan=lifespan)
+    app.state.price_cache = price_cache
+    app.state.market_source = source
+
+    app.include_router(create_stream_router(price_cache))  # GET /api/stream/prices
+    # app.include_router(portfolio_router), watchlist_router, chat_router ...
+    # Static Next.js export is mounted LAST so /api/* wins (see below).
+    return app
 
 
-def get_price_cache() -> PriceCache:
-    return app.state.price_cache
+app = create_app()
 
 
-def get_market_source() -> MarketDataSource:
-    return app.state.market_source
+# Dependencies for other routers. Read from request.app, not a global, so
+# tests that build their own app via create_app() get their own cache.
+def get_price_cache(request: Request) -> PriceCache:
+    return request.app.state.price_cache
+
+
+def get_market_source(request: Request) -> MarketDataSource:
+    return request.app.state.market_source
 ```
+
+A `create_app()` factory plus `request.app.state` dependencies means each test can build a
+fresh app with its own cache and source. Together with §9.4, nothing in the market layer is
+shared between app instances.
+
+Run it with `uv run uvicorn app.main:app --host 0.0.0.0 --port 8000` from `backend/`.
 
 Other routers (portfolio, watchlist, chat) access the cache and source via FastAPI
 dependency injection — none of them import `SimulatorDataSource`/`MassiveDataSource`
@@ -1504,66 +1716,94 @@ class TestSimulatorDataSource:
 
 ### 12.4 `MassiveDataSource` — mocked, no network/API key required
 
-`backend/tests/market/test_massive.py` (13 tests, 56% coverage of `massive_client.py` —
-expected, since the real SDK call is mocked out). The pattern: mock a Massive `TickerSnapshot`
-shape, patch `_fetch_snapshots`, call `_poll_once()` directly instead of running the loop:
+`backend/tests/market/test_massive.py` (13 tests, 56% coverage of `massive_client.py`;
+expected, since the real SDK call is mocked out). The pattern: build a snapshot, patch
+`_fetch_snapshots`, and call `_poll_once()` directly instead of running the loop.
+
+**The shipped helper hides the §7.4 defect.** It builds snapshots from `MagicMock`, which
+invents any attribute you ask for, so `snap.last_trade.timestamp` "exists" in tests and not
+in production:
 
 ```python
 def _make_snapshot(ticker: str, price: float, timestamp_ms: int) -> MagicMock:
     snap = MagicMock()
     snap.ticker = ticker
+    snap.last_trade = MagicMock()
     snap.last_trade.price = price
-    snap.last_trade.timestamp = timestamp_ms
+    snap.last_trade.timestamp = timestamp_ms   # attribute does not exist on the real model
     return snap
-
-
-@pytest.mark.asyncio
-class TestMassiveDataSource:
-
-    async def test_poll_updates_cache(self):
-        cache = PriceCache()
-        source = MassiveDataSource(api_key="test-key", price_cache=cache, poll_interval=60.0)
-        source._client = MagicMock()  # tests construct/attach a fake client directly
-
-        mock_snapshots = [
-            _make_snapshot("AAPL", 190.50, 1707580800000),
-            _make_snapshot("GOOGL", 175.25, 1707580800000),
-        ]
-        with patch.object(source, "_fetch_snapshots", return_value=mock_snapshots):
-            source._tickers = ["AAPL", "GOOGL"]
-            await source._poll_once()
-
-        assert cache.get_price("AAPL") == 190.50
-        assert cache.get_price("GOOGL") == 175.25
-
-    async def test_malformed_snapshot_skipped(self):
-        cache = PriceCache()
-        source = MassiveDataSource(api_key="test-key", price_cache=cache, poll_interval=60.0)
-        source._client = MagicMock()
-        source._tickers = ["AAPL", "BAD"]
-
-        good_snap = _make_snapshot("AAPL", 190.50, 1707580800000)
-        bad_snap = MagicMock()
-        bad_snap.ticker = "BAD"
-        bad_snap.last_trade = None  # triggers AttributeError, caught and skipped
-
-        with patch.object(source, "_fetch_snapshots", return_value=[good_snap, bad_snap]):
-            await source._poll_once()
-
-        assert cache.get_price("AAPL") == 190.50
-        assert cache.get_price("BAD") is None
-
-    async def test_api_error_does_not_crash(self):
-        cache = PriceCache()
-        source = MassiveDataSource(api_key="test-key", price_cache=cache, poll_interval=60.0)
-        source._client = MagicMock()
-        source._tickers = ["AAPL"]
-
-        with patch.object(source, "_fetch_snapshots", side_effect=Exception("network error")):
-            await source._poll_once()  # must not raise
-
-        assert cache.get_price("AAPL") is None  # no update happened
 ```
+
+Replace it with the SDK's own deserializer, fed the raw JSON shape from
+`planning/MASSIVE_API.md` §3.1. Any attribute mismatch then fails the test the same way it
+fails in production:
+
+```python
+from massive.rest.models import TickerSnapshot
+
+
+def _make_snapshot(ticker: str, price: float, ts_ns: int = 1_707_580_800_000_000_000):
+    """Build a real TickerSnapshot from the raw API JSON shape."""
+    return TickerSnapshot.from_dict(
+        {"ticker": ticker, "lastTrade": {"p": price, "t": ts_ns}, "updated": ts_ns}
+    )
+```
+
+`test_timestamp_conversion` changes from milliseconds to nanoseconds, and two cases are worth
+adding:
+
+```python
+    async def test_timestamp_conversion(self):
+        """lastTrade.t is Unix nanoseconds; the cache stores Unix seconds."""
+        cache = PriceCache()
+        source = MassiveDataSource(api_key="test-key", price_cache=cache, poll_interval=60.0)
+        source._tickers = ["AAPL"]
+        source._client = MagicMock()
+
+        snaps = [_make_snapshot("AAPL", 190.50, 1_707_580_800_000_000_000)]
+        with patch.object(source, "_fetch_snapshots", return_value=snaps):
+            await source._poll_once()
+
+        assert cache.get("AAPL").timestamp == 1707580800.0
+
+    async def test_missing_last_trade_skipped(self):
+        """Overnight snapshots can lack lastTrade; skip them, keep the others."""
+        cache = PriceCache()
+        source = MassiveDataSource(api_key="test-key", price_cache=cache, poll_interval=60.0)
+        source._tickers = ["AAPL", "NOTR"]
+        source._client = MagicMock()
+
+        snaps = [
+            _make_snapshot("AAPL", 190.50),
+            TickerSnapshot.from_dict({"ticker": "NOTR", "updated": 1_707_580_800_000_000_000}),
+        ]
+        with patch.object(source, "_fetch_snapshots", return_value=snaps):
+            await source._poll_once()
+
+        assert cache.get_price("AAPL") == 190.50
+        assert cache.get_price("NOTR") is None
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            (1_707_580_800, 1707580800.0),                  # seconds
+            (1_707_580_800_000, 1707580800.0),              # milliseconds
+            (1_707_580_800_000_000, 1707580800.0),          # microseconds
+            (1_707_580_800_000_000_000, 1707580800.0),      # nanoseconds
+            (None, None),
+        ],
+    )
+    def test_to_epoch_seconds(self, raw, expected):
+        assert _to_epoch_seconds(raw) == expected
+```
+
+(Put `test_to_epoch_seconds` at module level, or drop the class-level `asyncio` mark for it;
+it is synchronous.)
+
+The existing error-path tests (`test_api_error_does_not_crash`, `test_malformed_snapshot_skipped`)
+keep working unchanged. With the §7.4 fix and the old `MagicMock` helper, only
+`test_timestamp_conversion` fails (checked 2026-10-08: 72 passed, 1 failed), which is the
+signal that the helper must change along with the code.
 
 ### 12.5 `create_market_data_source` — env var branching
 
@@ -1734,9 +1974,10 @@ __all__ = [
 - `planning/MARKET_INTERFACE.md`, `planning/MARKET_SIMULATOR.md` — prose walkthroughs this
   document consolidates and supersedes as the single detailed reference.
 - `planning/MASSIVE_API.md` — full Massive/Polygon.io API research, endpoint catalogue,
-  rate limits, and the unresolved timestamp-unit caveat (§7.3 above).
+  and rate limits. Its §6 timestamp caveat is resolved in §7.3–7.4 above: snapshot
+  `lastTrade.t` is nanoseconds, exposed by the SDK as `last_trade.sip_timestamp`.
 - `planning/archive/MARKET_DATA_DESIGN.md` — the pre-implementation version of this document;
   kept for history. This document reflects the actual shipped code where the two differ (see
-  §7.3's note on lazy imports, and §9's SSE payload/cadence corrections).
+  §7.4's note on lazy imports, and §9's SSE payload/cadence corrections).
 - `backend/app/market/` — the source of truth for every code block above.
 - `backend/CLAUDE.md` — quick-reference for backend developers using this subsystem.
