@@ -6,18 +6,17 @@ Implementation-ready, as-built design for the FinAlly market data subsystem: the
 `backend/app/main.py` should wire all of it into the FastAPI app lifecycle.
 
 **Status (revised 2026-10-08):** everything in §§1–9 is implemented in
-`backend/app/market/` (8 modules, ~500 lines, 73 passing tests). Code blocks in those sections
-match the source exactly, except where a section is labelled as a required fix. This revision
-checked every block against the code and the locked `massive==2.2.0` SDK, and found two
-defects in the shipped code:
+`backend/app/market/` (8 modules, ~500 lines, 82 passing tests). Code blocks in those sections
+match the source. This revision checked every block against the code and the locked
+`massive==2.2.0` SDK, and found two defects, both now fixed in the code:
 
 | § | Defect | Impact | Fix size |
 |---|---|---|---|
 | 7.4 | `massive_client.py` reads `snap.last_trade.timestamp`, which the SDK model does not have (the field is `sip_timestamp`, in nanoseconds). | **Massive mode delivers no prices at all**: every ticker is skipped with a warning. Simulator mode is unaffected. Tests miss it because they use `MagicMock` snapshots. | ~15 lines + test helper (§12.4) |
 | 9.4 | `stream.py` decorates a module-level `APIRouter`, so a second `create_stream_router()` call registers `/api/stream/prices` twice. | Only bites when two apps are built in one process (tests). | 2 lines |
 
-Both fixes were run against the real SDK and the existing suite before being written here.
-Neither has been applied to `backend/app/market/` yet.
+Both fixes are applied, with regression tests that fail on the old code (§12.4,
+`tests/market/test_stream.py`).
 
 §§10–13 (lifecycle wiring, watchlist coordination, testing patterns, error handling) describe
 how the rest of the backend should consume this subsystem: `main.py`, portfolio routes,
@@ -909,10 +908,10 @@ JSON keys onto these dataclass fields with no unit conversion:
 AttributeError: 'LastTrade' object has no attribute 'timestamp'
 ```
 
-### 7.4 Defect in the shipped `_poll_once()`, and the required fix
+### 7.4 Fixed defect: `_poll_once()` read a nonexistent timestamp field
 
-The shipped `massive_client.py` (lines 101-103) reads `snap.last_trade.timestamp / 1000.0`.
-With the real SDK that line raises `AttributeError` for **every** ticker. The `except
+The original `massive_client.py` read `snap.last_trade.timestamp / 1000.0`.
+With the real SDK that line raised `AttributeError` for **every** ticker. The `except
 (AttributeError, TypeError)` around it turns each failure into a "Skipping snapshot" warning.
 So in Massive mode the cache is never filled, the SSE stream sends nothing, and every trade
 gets "price not available". The 13 Massive tests still pass because they build snapshots with
@@ -1342,7 +1341,7 @@ a clean visualization.
 
 ---
 
-### 9.4 Known issue: the router is a module-level singleton
+### 9.4 Fixed issue: the router was a module-level singleton
 
 `router = APIRouter(...)` sits at module scope and `create_stream_router()` decorates the
 same object each time it is called. One call from `main.py` is fine. A second call (two
@@ -1584,7 +1583,7 @@ validate against `SEED_PRICES` in simulator mode) is a decision for those routes
 
 ## 12. Testing Strategy
 
-The actual suite: `backend/tests/market/`, 6 modules, 73 tests, 84% overall coverage
+The actual suite: `backend/tests/market/`, 7 modules, 82 tests, 92% overall coverage
 (`planning/MARKET_DATA_SUMMARY.md`). Patterns below are drawn directly from the real test
 files — accurate to what's checked in, not aspirational.
 
@@ -1720,7 +1719,7 @@ class TestSimulatorDataSource:
 expected, since the real SDK call is mocked out). The pattern: build a snapshot, patch
 `_fetch_snapshots`, and call `_poll_once()` directly instead of running the loop.
 
-**The shipped helper hides the §7.4 defect.** It builds snapshots from `MagicMock`, which
+**The original helper hid the §7.4 defect.** It built snapshots from `MagicMock`, which
 invents any attribute you ask for, so `snap.last_trade.timestamp` "exists" in tests and not
 in production:
 
@@ -1800,10 +1799,9 @@ adding:
 (Put `test_to_epoch_seconds` at module level, or drop the class-level `asyncio` mark for it;
 it is synchronous.)
 
-The existing error-path tests (`test_api_error_does_not_crash`, `test_malformed_snapshot_skipped`)
-keep working unchanged. With the §7.4 fix and the old `MagicMock` helper, only
-`test_timestamp_conversion` fails (checked 2026-10-08: 72 passed, 1 failed), which is the
-signal that the helper must change along with the code.
+All of the above is now in `test_massive.py`, plus `test_falls_back_to_updated_timestamp`.
+Run against the original `massive_client.py`, six Massive tests fail, so the defect can't come
+back silently.
 
 ### 12.5 `create_market_data_source` — env var branching
 
