@@ -57,3 +57,13 @@ uv run --extra dev ruff check app/ tests/ # Lint
 ```bash
 uv run market_data_demo.py   # Live terminal dashboard with simulated prices
 ```
+
+## Application Modules
+
+- `app/db/` — `get_conn()` context manager, `init_db()` (lazy schema + seed). DB path from `FINALLY_DB_PATH` (default `<repo>/db/finally.db`).
+- `app/portfolio.py` — `get_portfolio`, `execute_trade` (raises `TradeError`), `record_snapshot`, `get_history`.
+- `app/watchlist.py` — async `add_ticker`/`remove_ticker` keep the market data source in sync (raises `WatchlistError`).
+- `app/chat.py` — `handle_chat`; `LLM_MOCK=true` parses "buy 5 AAPL" / "add PYPL" deterministically.
+- `app/main.py` — app factory; static frontend from `FINALLY_STATIC_DIR` (default `backend/static`).
+
+LLM calls disable OpenRouter provider fallbacks and cap `max_tokens`: other providers returned malformed structured output. `app/__init__.py` pins litellm to its bundled model map.

@@ -5,6 +5,12 @@ FastAPI backend for the FinAlly AI Trading Workstation.
 ## Structure
 
 - `app/` - Application code
+  - `main.py` - App factory, lifespan (DB init, market data, snapshot task), static serving
+  - `api.py` - REST routes under `/api`
+  - `portfolio.py` - Valuation, trade execution, snapshots
+  - `watchlist.py` - Watchlist persisted and synced with the market data source
+  - `chat.py` - LLM prompt, structured output, mock mode, action execution
+  - `db/` - SQLite schema, lazy init and seed data
   - `market/` - Market data subsystem
     - `models.py` - PriceUpdate dataclass
     - `cache.py` - Thread-safe price cache

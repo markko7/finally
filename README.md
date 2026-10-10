@@ -26,15 +26,19 @@ Single Docker container serving everything on port 8000:
 ## Quick Start
 
 ```bash
-# Clone and configure
-cp .env.example .env
-# Add your OPENROUTER_API_KEY to .env
+cp .env.example .env              # add your OPENROUTER_API_KEY
+./scripts/start_mac.sh            # macOS/Linux (--build to rebuild)
+.\scripts\start_windows.ps1       # Windows (-Build to rebuild)
+```
 
-# Run with Docker
-docker build -t finally .
-docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
+Open http://localhost:8000. Stop with `scripts/stop_mac.sh` or `scripts/stop_windows.ps1`; data persists in the `finally-data` volume.
 
-# Open http://localhost:8000
+## Testing
+
+```bash
+cd backend && uv run --extra dev pytest                               # backend unit tests
+cd frontend && npm test                                               # frontend unit tests
+docker compose -f test/docker-compose.test.yml up --build --exit-code-from playwright   # E2E
 ```
 
 ## Environment Variables
